@@ -57,11 +57,7 @@ def cpu_usage():
 def send_rest(data, timeout=15):
     start = time.time()
     try:
-        resp = requests.post(
-            "http://127.0.0.1:5000/echo",
-            json={"payload": data},
-            timeout=timeout
-        )
+        resp = requests.post("http://127.0.0.1:5000/echo", json={"payload": data}, timeout=timeout)
         elapsed = (time.time() - start) * 1000
         return resp.status_code, len(resp.content), elapsed, "REST"
     except requests.exceptions.RequestException:
@@ -80,45 +76,54 @@ def choose_protocol_level1(size):
     if size < 1000:
         return "REST", "payload <1KB"
     else:
-        return "gRPC", "payload >=1KB"
+        return "gRPC", "payload ≥1KB"
 
-def choose_protocol_level2(size, latency, download_bw):
-    if latency > 200 or download_bw < 5:
-        return "REST", "network slow"
-    elif size < 1000:
-        return "REST", "small payload"
-    else:
-        return "gRPC", "large payload"
+def choose_protocol_level2(size, latency, download_bw, concurrency, data_type, sla_ms):
+    if concurrency >= 300:
+        return "gRPC", "high concurrency"
+    if data_type == "nested":
+        return "gRPC", "nested data"
+    if size < 1000 and concurrency < 300:
+        return "REST", "small payload low load"
+    if latency > sla_ms:
+        return "gRPC", "tight SLA"
+    if download_bw < 5 and size < 1000 and concurrency < 300:
+        return "REST", "low BW small payload"
+    return "gRPC", "default large/strict"
 
-def choose_protocol_level3(size, latency, download_bw, cpu, response_time=None):
-    if latency > 200:
-        return "REST", "forced REST high latency"
-    if download_bw < 5:
-        return "REST", "forced REST low bandwidth"
-    if size < 1000:
-        return "REST", "forced REST small payload"
+def choose_protocol_level3(size, latency, download_bw, cpu, concurrency, data_type, sla_ms, last_rtt=None):
     score_rest, score_grpc = 0, 0
-    if latency > 100: score_rest += 2
-    else: score_grpc += 2
-    if download_bw < 10: score_rest += 2
-    else: score_grpc += 2
+    if concurrency >= 500: score_grpc += 4
+    elif concurrency >= 300: score_grpc += 3
+    else: score_rest += 1
+    if data_type == "nested": score_grpc += 3
+    else: score_grpc += 1
     if size >= 1000: score_grpc += 2
     else: score_rest += 2
-    if cpu > 70: score_rest += 1
-    else: score_grpc += 1
-    if response_time and response_time > 500:
-        score_rest += 2
-    elif response_time and response_time < 200:
-        score_grpc += 1
-    return ("REST", f"score REST={score_rest}, gRPC={score_grpc}") if score_rest >= score_grpc else ("gRPC", f"score REST={score_rest}, gRPC={score_grpc}")
-
-def get_ground_truth(size, latency, download_bw):
-    if size < 1000:
-        return "REST"
-    elif latency > 200 or download_bw < 5:
-        return "REST"
+    if latency > sla_ms: score_grpc += 2
+    else: score_rest += 1
+    if download_bw < 5:
+        score_rest += 1
+        if size >= 1000 or concurrency >= 300: score_grpc += 2
     else:
+        score_grpc += 1
+    if cpu > 80: score_rest += 1
+    else: score_grpc += 1
+    if last_rtt is not None:
+        if last_rtt > sla_ms: score_grpc += 1
+        else: score_rest += 1
+    return ("gRPC", f"score REST={score_rest}, gRPC={score_grpc}") if score_grpc >= score_rest else ("REST", f"score REST={score_rest}, gRPC={score_grpc}")
+
+def get_ground_truth(size, latency, download_bw, concurrency, data_type, sla_ms):
+    if concurrency >= 300:
         return "gRPC"
+    if data_type == "nested":
+        return "gRPC"
+    if size < 1000 and concurrency < 300:
+        return "REST"
+    if latency > sla_ms:
+        return "gRPC"
+    return "gRPC"
 
 def run_with_rtt(proto, data):
     if proto == "REST":
@@ -127,32 +132,29 @@ def run_with_rtt(proto, data):
         _, _, rtt, _ = send_grpc(data)
     return rtt
 
-def run_batch(batch_name, latency, download_bw, upload_bw, cpu, total=5):
+def run_batch(batch_name, latency, download_bw, upload_bw, cpu, concurrency, total=5):
     print(f"\n== {batch_name} ==")
-    print(f"Latency={latency}ms | Download={download_bw}Mbps | Upload={upload_bw}Mbps | CPU={cpu}%\n")
+    print(f"Latency={latency}ms | Download={download_bw}Mbps | Upload={upload_bw}Mbps | CPU={cpu}% | Concurrency={concurrency}\n")
     acc1, acc2, acc3 = 0, 0, 0
     for i in range(total):
         size = random.choice([500, 5000, 50000, 500000, 2000000])
+        data_type = random.choice(["flat", "nested"])
+        sla_ms = 100 if data_type == "flat" else 800
         data = "X" * size
-        gt = get_ground_truth(size, latency, download_bw)
-
+        gt = get_ground_truth(size, latency, download_bw, concurrency, data_type, sla_ms)
         proto1, reason1 = choose_protocol_level1(size)
         rtt1 = run_with_rtt(proto1, data)
         if proto1 == gt: acc1 += 1
-
-        proto2, reason2 = choose_protocol_level2(size, latency, download_bw)
+        proto2, reason2 = choose_protocol_level2(size, latency, download_bw, concurrency, data_type, sla_ms)
         rtt2 = run_with_rtt(proto2, data)
         if proto2 == gt: acc2 += 1
-
-        proto3, reason3 = choose_protocol_level3(size, latency, download_bw, cpu)
+        proto3, reason3 = choose_protocol_level3(size, latency, download_bw, cpu, concurrency, data_type, sla_ms, last_rtt=rtt2)
         rtt3 = run_with_rtt(proto3, data)
         if proto3 == gt: acc3 += 1
-
-        print(f"Test {i+1}: size={size}B | GT={gt}")
+        print(f"Test {i+1}: size={size}B | type={data_type} | SLA={sla_ms}ms | GT={gt}")
         print(f"  [L1] {proto1} | reason={reason1} | correct={proto1==gt} | RTT={rtt1:.2f}ms")
         print(f"  [L2] {proto2} | reason={reason2} | correct={proto2==gt} | RTT={rtt2:.2f}ms")
         print(f"  [L3] {proto3} | reason={reason3} | correct={proto3==gt} | RTT={rtt3:.2f}ms\n")
-
     print("== Evaluation Summary ==")
     print(f"Level 1 Accuracy: {acc1}/{total} = {acc1/total*100:.2f}%")
     print(f"Level 2 Accuracy: {acc2}/{total} = {acc2/total*100:.2f}%")
@@ -162,11 +164,11 @@ def main():
     server = start_grpc_server()
     start_rest_server()
     try:
-        run_batch("Batch 1 (Normal)", latency=50, download_bw=15, upload_bw=2, cpu=20)
-        run_batch("Batch 2 (Low Bandwidth)", latency=50, download_bw=3, upload_bw=0.8, cpu=30)
-        run_batch("Batch 3 (High Latency)", latency=250, download_bw=12, upload_bw=2, cpu=40)
-        run_batch("Batch 4 (High CPU)", latency=60, download_bw=14, upload_bw=1.5, cpu=85)
-        run_batch("Batch 5 (Aggressive L3 Case)", latency=80, download_bw=4, upload_bw=2, cpu=10)
+        run_batch("Batch 1 (Normal)", latency=50, download_bw=15, upload_bw=2, cpu=20, concurrency=100)
+        run_batch("Batch 2 (Low Bandwidth)", latency=50, download_bw=3, upload_bw=0.8, cpu=30, concurrency=150)
+        run_batch("Batch 3 (High Latency)", latency=250, download_bw=12, upload_bw=2, cpu=40, concurrency=200)
+        run_batch("Batch 4 (High CPU)", latency=60, download_bw=14, upload_bw=1.5, cpu=85, concurrency=250)
+        run_batch("Batch 5 (High Concurrency Mixed)", latency=80, download_bw=4, upload_bw=2, cpu=10, concurrency=500)
     finally:
         server.stop(0)
 
